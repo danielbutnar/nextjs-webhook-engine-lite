@@ -1,13 +1,15 @@
 # nextjs-webhook-engine-lite
 
-Production reference architecture for high-throughput, secure webhook ingestion on serverless runtimes using the Next.js 15 App Router and Upstash Redis REST.
+> ⚡ **Need turnkey Stripe, Lemon Squeezy, and Clerk integration?**  
+> Check out [**Next.js Webhook Engine Pro ($39)**](YOUR_LEMON_SQUEEZY_PRODUCT_URL) — Instant `.zip` download with dynamic multi-provider routing (`/api/webhooks/[provider]`), zero-downtime secret rotation, Prisma SQL + Redis distributed locking, and the automated CLI attack simulator.
 
 ---
+
+Production reference architecture for high-throughput, secure webhook ingestion on serverless runtimes using the Next.js 15 App Router and Upstash Redis REST.
 
 ## Architectural Problem Statement
 
 Serverless webhook handlers encounter three recurring failure modes:
-
 1. **Stream Lockout:** Calling `req.json()` locks the incoming `ReadableStream`. Re-serializing parsed objects mutates key order and whitespace, causing HMAC digest mismatches.
 2. **Timing Attacks & Buffer Panics:** Standard string equality (`a === b`) leaks character matching times. Calling `crypto.timingSafeEqual()` on mismatched buffer lengths throws an unhandled `RangeError` in Node.js, crashing the worker.
 3. **Lambda Concurrency Collisions:** Rapid provider retries dispatch identical event IDs across independent, stateless Lambda instances. Traditional relational databases and stateful TCP connection pools face connection exhaustion during sudden traffic spikes.
@@ -46,7 +48,9 @@ HTTP POST /api/webhooks
                  │
                  └──► [Error]   ──► DEL webhook:lock:{id} (Unblock Provider Retries)
                                     Return 500 Internal Server Error
+```
 
+---
 
 ## State Machine
 
@@ -58,44 +62,59 @@ HTTP POST /api/webhooks
 | **Handler Failure** | Present (Released) | None | 500 Error | `"Internal processing error"` | Lock purged immediately to allow upstream provider retries. |
 | **Tampered Request** | Unchecked | Unchecked | 401 Unauthorized | `"Invalid cryptographic signature"` | Execution halted before JSON parsing or lock allocation. |
 
-Quickstart
-1. Installation
+---
 
+## Quickstart
+
+### 1. Installation
+
+```bash
 git clone [https://github.com/your-org/nextjs-webhook-engine-lite.git](https://github.com/your-org/nextjs-webhook-engine-lite.git)
 cd nextjs-webhook-engine-lite
 npm install
+```
 
+### 2. Configure Environment
 
-2. Configure Environment
-Copy .env.example to .env.local:
-
+```bash
 cp .env.example .env.local
+```
 
+```env
 # Optional for local dev: The engine automatically falls back to an internal
 # in-memory TTL store if credentials are missing or placeholders.
 UPSTASH_REDIS_REST_URL="[https://example.upstash.io](https://example.upstash.io)"
 UPSTASH_REDIS_REST_TOKEN="your-database-token"
 WEBHOOK_SECRET="local_dev_secret_key_12345"
+```
 
-3. Run Development Server
+### 3. Run Development Server
 
+```bash
 npm run dev
+```
 
-4. Execute Multi-Stage Verification Suite
-In a separate terminal, run the automated verification test harness:
+### 4. Execute Multi-Stage Verification Suite
 
+In a separate terminal, test the cryptographic and concurrency boundaries:
+
+```bash
 npm run test:attack
+```
+
+---
 
 ## Architectural Edition Comparison
 
-| Capability | Lite (Open Source) | Pro ($39 Commercial) |
+| Capability | Lite (Open Source) | Pro ($39 Commercial Bundle) |
 | :--- | :--- | :--- |
-| **Framework Target** | Next.js 15 App Router | Next.js 14/15, Remix, Astro, SvelteKit |
-| **Runtime Model** | Node.js Serverless (`runtime = 'nodejs'`) | Edge, Node.js, and Cloudflare Workers |
-| **Provider Support** | Generic HMAC SHA-256 | Stripe, Shopify, GitHub, Svix, Resend, Paddle |
-| **Idempotency Store** | Upstash Redis REST / In-Memory Fallback | Upstash Redis, AWS DynamoDB, Cloudflare KV |
-| **Replay Protection** | Cryptographic Digest Matching | Tolerance-Checked Timestamp Drift Windows |
-| **Dead-Letter Queue** | Cloud Logging / Console Tracing | Automatic S3/SQS/Postgres Dead-Letter Archival |
-| **Payload Ingestion** | Full Body Buffering | Streaming Size Bounds & Pre-Allocated Limits |
-| **Licensing** | MIT | Commercial Developer License |
+| **Target Framework** | Next.js 14/15 App Router | Next.js 14/15 App Router |
+| **Routing Architecture** | Single manual route (`/api/webhooks`) | Dynamic Catch-All (`/api/webhooks/[provider]`) |
+| **Supported Providers** | Generic HMAC SHA-256 implementation | **Stripe, Lemon Squeezy, Clerk (Svix)** |
+| **Key Management** | Single static secret key | **Zero-Downtime Comma-Delimited Secret Rotation** |
+| **Idempotency Adapters**| Upstash Redis REST + Memory Fallback | **Upstash Redis REST + Prisma ORM (PostgreSQL, SQLite, MySQL) + Memory** |
+| **Testing Harness** | Single-endpoint attack simulation | **Automated Multi-Provider CLI Attack Simulator (`scripts/test-webhook.ts`)** |
+| **Delivery Model** | Public Git Repository | **Production `.zip` Archive + Drop-in Ready Source** |
+| **License** | MIT | Commercial Developer License (Unlimited Personal & Client Projects) |
 
+👉 **[Upgrade to Next.js Webhook Engine Pro ($39) — Instant .ZIP Access](YOUR_LEMON_SQUEEZY_PRODUCT_URL)**
