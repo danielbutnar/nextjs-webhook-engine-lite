@@ -117,4 +117,4 @@ npm run test:attack
 | **Delivery Model** | Public Git Repository | **Production `.zip` Archive + Drop-in Ready Source** |
 | **License** | MIT | Commercial Developer License (Unlimited Personal & Client Projects) |
 
-👉 **[Upgrade to Next.js Webhook Engine Pro ($39) — Instant .ZIP Access](YOUR_LEMON_SQUEEZY_PRODUCT_URL)**
+👉 **[Upgrade to Next.js Webhook Engine Pro ($39) — Instant .ZIP Access](https://buy.stripe.com/8x28wPcmx2M28EldEneQM02)**
