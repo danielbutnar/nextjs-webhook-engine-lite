@@ -1,120 +1,132 @@
 # nextjs-webhook-engine-lite
 
-> ⚡ **Need turnkey Stripe, Lemon Squeezy, and Clerk integration?**  
-> Check out [**Next.js Webhook Engine Pro ($39)**](YOUR_LEMON_SQUEEZY_PRODUCT_URL) — Instant `.zip` download with dynamic multi-provider routing (`/api/webhooks/[provider]`), zero-downtime secret rotation, Prisma SQL + Redis distributed locking, and the automated CLI attack simulator.
+A small reference implementation of secure, idempotent webhook handling in the Next.js 15 App Router, backed by Upstash Redis REST.
+
+I built this while learning how webhook endpoints break on serverless runtimes. Three failure modes kept coming up and none of them were obvious from the framework docs, so this repo is my working notes plus the code that handles them.
+
+**Status:** learning project. The code runs and the attack script passes against it, but it has not been used in production and there is no automated test suite yet. See [Limitations](#limitations) before using any of it.
 
 ---
 
-Production reference architecture for high-throughput, secure webhook ingestion on serverless runtimes using the Next.js 15 App Router and Upstash Redis REST.
+## The three problems
 
-## Architectural Problem Statement
+### 1. You can only read the body once
 
-Serverless webhook handlers encounter three recurring failure modes:
-1. **Stream Lockout:** Calling `req.json()` locks the incoming `ReadableStream`. Re-serializing parsed objects mutates key order and whitespace, causing HMAC digest mismatches.
-2. **Timing Attacks & Buffer Panics:** Standard string equality (`a === b`) leaks character matching times. Calling `crypto.timingSafeEqual()` on mismatched buffer lengths throws an unhandled `RangeError` in Node.js, crashing the worker.
-3. **Lambda Concurrency Collisions:** Rapid provider retries dispatch identical event IDs across independent, stateless Lambda instances. Traditional relational databases and stateful TCP connection pools face connection exhaustion during sudden traffic spikes.
+`req.json()` consumes the request's `ReadableStream`. Once it is consumed you cannot get the raw bytes back, and HMAC signatures are computed over the raw bytes.
 
-`nextjs-webhook-engine-lite` resolves these vectors through single-pass raw streaming, byte-length-guarded constant-time verification, and stateless HTTP Redis idempotency primitives.
+The tempting fix is to `JSON.stringify()` the parsed object and hash that instead. It does not work. `JSON.stringify` gives no guarantee of the sender's key order or whitespace, so the reconstructed string hashes to a different digest and every signature check fails, including the legitimate ones.
+
+The fix is to read once with `req.text()`, verify the signature against that exact string, and only then `JSON.parse()` it.
+
+### 2. `timingSafeEqual` throws on a length mismatch
+
+Comparing signatures with `===` leaks timing information. String comparison exits on the first differing byte, so an attacker who can measure response times can work out a valid signature one character at a time. Node's `crypto.timingSafeEqual()` exists for this.
+
+The catch is that `timingSafeEqual` throws a `RangeError` when the two buffers have different lengths. A forged signature of the wrong length does not return `false`, it crashes the handler with an unhandled exception. Lengths have to be compared first, with an early return, before the constant-time comparison runs.
+
+### 3. Retries land on parallel instances
+
+Providers retry when they do not get a fast `200`, and serverless instances are stateless and independent of each other. Two retries of the same event can hit two cold instances at the same moment. Both look for a record of the event, both find nothing, and both process it. If the handler charges a card or sends an email, it happens twice.
+
+A `SELECT` followed by an `INSERT` does not close this, because there is a window between the two statements where both instances have read "not seen". Redis `SET NX` is atomic, so exactly one instance acquires the lock. Using Upstash over REST rather than a TCP client also avoids connection pool exhaustion when a provider bursts retries at you.
 
 ---
 
-## Data Flow Pipeline
+## How a request flows
 
-```text
+```
 HTTP POST /api/webhooks
-       │
-       ▼
-[req.text() Stream Ingestion] ────────► Raw Byte Stream Preserved
-       │
-       ▼
-[Timing-Safe HMAC Check]      ────────► Mismatch / Forgery: 401 Unauthorized
-       │ (Pass)
-       ▼
-[Safe JSON Deserialization]   ────────► Malformed JSON / Missing ID: 400 Bad Request
-       │ (Valid event.id)
-       ▼
-[Redis SET NX Lock Boundary]
-       ├──► Key "webhook:done:{id}" exists ───► 200 OK ({ status: "already_processed" })
-       ├──► Key "webhook:lock:{id}" exists ───► 202 Accepted ({ status: "concurrent_request_ignored" })
-       └──► Lock Acquired (TTL 60s)
-                 │
-                 ▼
-       [Execute Business Logic]
-                 │
-                 ├──► [Success] ──► Atomic Redis Pipeline:
-                 │                    - SET webhook:done:{id} (EX 7 Days)
-                 │                    - DEL webhook:lock:{id}
-                 │                  Return 200 OK ({ status: "success" })
-                 │
-                 └──► [Error]   ──► DEL webhook:lock:{id} (Unblock Provider Retries)
-                                    Return 500 Internal Server Error
+       |
+       v
+  req.text()                -> raw byte string preserved
+       |
+       v
+  timing-safe HMAC check    -> mismatch: 401 Unauthorized
+       | pass
+       v
+  JSON.parse                -> malformed or no event.id: 400 Bad Request
+       | valid
+       v
+  Redis SET NX
+       |-- webhook:done:{id} exists  -> 200 { status: "already_processed" }
+       |-- webhook:lock:{id} exists  -> 202 { status: "concurrent_request_ignored" }
+       |-- lock acquired (TTL 60s)
+                |
+                v
+          run handler
+                |
+                |-- success -> pipeline: SET webhook:done:{id} EX 7d, DEL lock
+                |              200 { status: "success" }
+                |
+                |-- error   -> DEL webhook:lock:{id} so the provider can retry
+                               500 Internal Server Error
 ```
 
----
+## Behaviour
 
-## State Machine
-
-| Event Scenario | `webhook:lock:{id}` | `webhook:done:{id}` | HTTP Status | Response Status | System Action |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **First Delivery** | None | None | 200 OK | `"success"` | Lock acquired, handler executes, retention committed, lock evicted. |
-| **Concurrent Race** | Present (`"1"`) | None | 202 Accepted | `"concurrent_request_ignored"` | Execution bypassed. Prevents duplicate side-effects. |
-| **Subsequent Replay** | None | Present (`"1"`) | 200 OK | `"already_processed"` | Execution bypassed. Retains idempotency for 7 days. |
-| **Handler Failure** | Present (Released) | None | 500 Error | `"Internal processing error"` | Lock purged immediately to allow upstream provider retries. |
-| **Tampered Request** | Unchecked | Unchecked | 401 Unauthorized | `"Invalid cryptographic signature"` | Execution halted before JSON parsing or lock allocation. |
+| Scenario | `lock:{id}` | `done:{id}` | Status | Response | What happens |
+| --- | --- | --- | --- | --- | --- |
+| First delivery | none | none | 200 | `success` | Lock taken, handler runs, result recorded, lock released |
+| Concurrent retry | present | none | 202 | `concurrent_request_ignored` | Handler skipped, no duplicate side effects |
+| Later replay | none | present | 200 | `already_processed` | Handler skipped, remembered for 7 days |
+| Handler throws | released | none | 500 | error | Lock cleared immediately so the provider retries |
+| Bad signature | untouched | untouched | 401 | invalid signature | Rejected before parsing or locking |
 
 ---
 
-## Quickstart
-
-### 1. Installation
+## Running it
 
 ```bash
-git clone [https://github.com/your-org/nextjs-webhook-engine-lite.git](https://github.com/your-org/nextjs-webhook-engine-lite.git)
+git clone https://github.com/danielbutnar/nextjs-webhook-engine-lite.git
 cd nextjs-webhook-engine-lite
 npm install
-```
-
-### 2. Configure Environment
-
-```bash
 cp .env.example .env.local
 ```
 
-```env
-# Optional for local dev: The engine automatically falls back to an internal
-# in-memory TTL store if credentials are missing or placeholders.
-UPSTASH_REDIS_REST_URL="[https://example.upstash.io](https://example.upstash.io)"
+Fill in `.env.local`:
+
+```
+UPSTASH_REDIS_REST_URL="https://your-db.upstash.io"
 UPSTASH_REDIS_REST_TOKEN="your-database-token"
 WEBHOOK_SECRET="local_dev_secret_key_12345"
 ```
 
-### 3. Run Development Server
+If the Upstash values are missing or left as placeholders, the engine falls back to an in-memory TTL store. That is fine for local development and useless in production, for the reason described in the limitations below.
 
 ```bash
 npm run dev
 ```
 
-### 4. Execute Multi-Stage Verification Suite
-
-In a separate terminal, test the cryptographic and concurrency boundaries:
+Then, in a second terminal, fire the checks against the running server:
 
 ```bash
 npm run test:attack
 ```
 
+This sends a valid signed request, a tampered one, a wrong-length signature, and two identical events back to back, and prints what came back.
+
 ---
 
-## Architectural Edition Comparison
+## Limitations
 
-| Capability | Lite (Open Source) | Pro ($39 Commercial Bundle) |
-| :--- | :--- | :--- |
-| **Target Framework** | Next.js 14/15 App Router | Next.js 14/15 App Router |
-| **Routing Architecture** | Single manual route (`/api/webhooks`) | Dynamic Catch-All (`/api/webhooks/[provider]`) |
-| **Supported Providers** | Generic HMAC SHA-256 implementation | **Stripe, Lemon Squeezy, Clerk (Svix)** |
-| **Key Management** | Single static secret key | **Zero-Downtime Comma-Delimited Secret Rotation** |
-| **Idempotency Adapters**| Upstash Redis REST + Memory Fallback | **Upstash Redis REST + Prisma ORM (PostgreSQL, SQLite, MySQL) + Memory** |
-| **Testing Harness** | Single-endpoint attack simulation | **Automated Multi-Provider CLI Attack Simulator (`scripts/test-webhook.ts`)** |
-| **Delivery Model** | Public Git Repository | **Production `.zip` Archive + Drop-in Ready Source** |
-| **License** | MIT | Commercial Developer License (Unlimited Personal & Client Projects) |
+Worth being explicit about what this does not do:
 
-👉 **[Upgrade to Next.js Webhook Engine Pro ($39) — Instant .ZIP Access](https://buy.stripe.com/8x28wPcmx2M28EldEneQM02)**
+- **No automated tests.** `test:attack` is a manual script that needs a dev server already running. The verification and locking logic is not covered by anything you can run in CI.
+- **Generic HMAC SHA-256 only.** Real providers differ. Stripe and Svix sign a timestamp along with the payload and expect you to reject anything outside a short replay window. That check is not implemented here, so a captured valid request stays replayable until its idempotency key expires.
+- **One static secret.** Rotating it means a window where in-flight webhooks fail.
+- **The in-memory fallback gives no real guarantee.** It is per-instance, and the whole point of the Redis lock is coordinating across instances. It exists so the repo runs without credentials, nothing more.
+- **Fixed 60 second lock TTL.** A handler that runs longer can have its lock expire while it is still working, which reopens the duplicate-processing window it was meant to close.
+- **Redis failures are not handled.** If Upstash is unreachable the request fails rather than degrading in any considered way.
+
+## What I would change next
+
+- Tests around the signature and lock logic with Vitest, so the guarantees above are checkable instead of just claimed.
+- Timestamp validation with a replay window.
+- A configurable lock TTL that a long-running handler can renew while it works.
+- A decision on what should happen when Redis is down, rather than the current accident.
+
+---
+
+## License
+
+MIT.
